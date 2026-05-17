@@ -1,0 +1,589 @@
+# Real-Time Stock Market Anomaly Detection
+### PDC Final Project — Parallel & Distributed Computing
+
+> **What this project does in one sentence:**  
+> It streams 150–200 million real NYSE trade records through a distributed pipeline — Kafka → Flink → Cassandra → Grafana — and automatically flags abnormal market behaviour (price crashes, price spikes, volume explosions) in real time.
+
+---
+
+## Table of Contents
+
+1. [What You Are Building (Plain English)](#1-what-you-are-building)
+2. [System Architecture](#2-system-architecture)
+3. [Technology Stack — What Each Tool Is](#3-technology-stack)
+4. [Project Files Explained](#4-project-files-explained)
+5. [Step-by-Step Setup & Execution](#5-step-by-step-setup--execution)
+6. [How the Code Works — File by File](#6-how-the-code-works)
+7. [PDC Course Concepts in This Project](#7-pdc-course-concepts)
+8. [Viva Q&A Preparation](#8-viva-qa-preparation)
+9. [Port & Service Reference](#9-port--service-reference)
+10. [Troubleshooting](#10-troubleshooting)
+
+---
+
+## 1. What You Are Building
+
+You are building a **real-time Big Data pipeline** for stock market anomaly detection. Here is the story:
+
+- The **NYSE (New York Stock Exchange)** publishes a free daily dataset called **TAQ (Trade and Quote)**. One day's file is **~3.4 GB compressed** and contains **~150–200 million individual trade records** — every single trade on every US stock exchange for that day.
+- Your project **replays** this dataset through a pipeline at a configurable speed (e.g., 1,000 messages/second).
+- The pipeline **detects anomalies** — sudden crashes, spikes, or volume explosions — for 12 major stocks: `AAPL MSFT GOOGL AMZN TSLA NVDA META NFLX AMD INTC BABA JPM`
+- Results are stored in a database and displayed on a live dashboard.
+
+**The entire infrastructure runs on your Windows laptop via Docker** — no cloud account needed.
+
+---
+
+## 2. System Architecture
+
+```
+NYSE Daily TAQ Dataset  (~3.4 GB compressed, ~150-200M records/day)
+         │
+         ▼
+  [PRODUCER]  replay_producer.py          ← runs on Windows host (Python)
+  • Reads .gz file line by line (streaming — never fully unzips)
+  • Filters for 12 symbols only
+  • Converts each trade to JSON
+  • Publishes to Kafka at 1,000 msg/sec (configurable)
+         │
+         │  Kafka Topic: "stock-trades"
+         ▼
+  [BROKER]  Apache Kafka                  ← Docker container
+  • Receives and buffers all trade messages
+  • Decouples producer from consumer
+  • Zookeeper manages Kafka cluster metadata
+         │
+         ▼
+  [PROCESSOR]  flink_job.py               ← runs inside Flink Docker container
+  • Consumes messages from Kafka
+  • Groups trades into 10-second tumbling windows per symbol
+  • Detects 3 anomaly types (volume_spike / flash_crash / price_spike)
+  • Writes ALL trades + anomalies to Cassandra
+         │
+         ▼
+  [STORAGE]  Apache Cassandra             ← Docker container
+  ├── stock_market.trades      (every trade tick, kept 24 hours)
+  └── stock_market.anomalies   (detected anomalies, kept 7 days)
+         │
+         ▼
+  [VISUALISATION]  Grafana                ← Docker container → http://localhost:3000
+  • Panel 1: Trade prices per symbol (time series)
+  • Panel 2: Volume per symbol (bar chart)
+  • Panel 3: Detected anomalies (live table)
+```
+
+### Data Flow Summary
+
+| Stage | Component | Role |
+|---|---|---|
+| Ingest | `replay_producer.py` | Read NYSE file, publish to Kafka |
+| Transport | Apache Kafka + Zookeeper | Message queue / broker |
+| Process | `flink_job.py` in Flink container | Windowed anomaly detection |
+| Store | Apache Cassandra | Persistent NoSQL storage |
+| Visualise | Grafana | Live dashboard |
+
+---
+
+## 3. Technology Stack
+
+### Apache Kafka
+- A **distributed message broker** (like a post office for data).
+- Producers send messages to **topics**; consumers read from topics.
+- This project uses one topic: `stock-trades`.
+- Kafka retains messages for 1 hour (`KAFKA_LOG_RETENTION_HOURS: 1`).
+- Two listener addresses exist:
+  - `kafka:29092` — used *inside* Docker network (by Flink job)
+  - `localhost:9092` — used *outside* Docker network (by replay producer on Windows)
+- **Zookeeper** is Kafka's cluster manager (handles leader election, metadata).
+
+### Apache Flink
+- A **distributed stream processing framework**.
+- In this project, Flink's Docker image is used as the *execution environment*, but the job itself is a plain Python script (not a PyFlink JAR).
+- The script uses **tumbling windows** — fixed 10-second non-overlapping time buckets.
+- The Flink cluster has two containers: `flink-jobmanager` (coordinates jobs) and `flink-taskmanager` (executes tasks, configured with 4 task slots).
+
+### Apache Cassandra
+- A **distributed NoSQL database** optimised for high-speed writes.
+- Uses a keyspace (`stock_market`) with two tables.
+- The **primary key design** matters:
+  - `trades`: `PRIMARY KEY (symbol, trade_time)` — partitioned by stock symbol, clustered by time descending.
+  - `anomalies`: `PRIMARY KEY (symbol, detected_at)` — same pattern.
+- Data TTL (Time-To-Live): trades expire after **24 hours**, anomalies after **7 days**.
+
+### Grafana
+- A **dashboarding and visualisation tool**.
+- Connects to Cassandra via the **HadesArchitect Cassandra plugin** (installed automatically via Docker).
+- Displays 3 panels querying the two Cassandra tables.
+- The script `setup_grafana.py` provisions the dashboard automatically via Grafana's REST API.
+
+### Docker & Docker Compose
+- **Docker**: runs each service in an isolated container.
+- **Docker Compose**: defines and orchestrates all 6 containers together.
+- All containers are on a shared Docker network called `stock-net` so they can communicate using container names as hostnames (e.g., `kafka`, `cassandra`).
+
+---
+
+## 4. Project Files Explained
+
+```
+pdcfinal/
+├── docker-compose.yml       ← Defines all 6 Docker containers + network
+├── config.py                ← Shared constants: symbol list, Kafka broker address
+├── requirements.txt         ← Python packages for Windows host
+├── setup_grafana.py         ← Auto-provisions Grafana dashboard via REST API
+├── producer/
+│   └── replay_producer.py   ← Reads NYSE .gz file → sends to Kafka
+├── flink_job/
+│   └── flink_job.py         ← Kafka consumer → anomaly detection → Cassandra
+└── cassandra/
+    └── schema.cql           ← Creates keyspace + 2 tables in Cassandra
+```
+
+### `config.py`
+Shared configuration imported by `replay_producer.py`. Defines:
+- `SYMBOLS` — the 12 stocks to track
+- `KAFKA_BROKER = "localhost:9092"` — host-side connection
+- `KAFKA_TOPIC = "stock-trades"`
+
+### `docker-compose.yml`
+Brings up 6 services on the `stock-net` bridge network:
+1. **zookeeper** — Kafka dependency, port 2181
+2. **kafka** — message broker, ports 9092 (host) / 29092 (internal)
+3. **flink-jobmanager** — Flink coordinator, port 8081 (Web UI); mounts `./flink_job` → `/opt/flink_job`
+4. **flink-taskmanager** — Flink executor, 4 task slots
+5. **cassandra** — NoSQL DB, port 9042; health-checked via `cqlsh`
+6. **grafana** — dashboard, port 3000; auto-installs Cassandra plugin
+
+### `producer/replay_producer.py`
+- Reads the NYSE `.gz` file using Python's `gzip` module *without ever decompressing it to disk*.
+- Parses each pipe-delimited line, keeps only the 12 tracked symbols.
+- Sends JSON records `{"symbol", "price", "volume", "trade_time"}` to Kafka.
+- Configurable `MESSAGES_PER_SECOND` (0 = unlimited) and `LOOP_FOREVER`.
+- **You must update `DATA_DIR`** on line 85 to point to where you saved the `.gz` file.
+
+### `flink_job/flink_job.py`
+- Runs *inside* the `flink-jobmanager` container.
+- Consumes the `stock-trades` topic from Kafka (`kafka:29092`).
+- Implements **10-second tumbling windows** per symbol using in-memory dicts.
+- Calls `detect_anomalies()` on every closed window.
+- Writes every trade and every anomaly to Cassandra.
+
+### `cassandra/schema.cql`
+Creates the `stock_market` keyspace and two tables. Run once after Cassandra starts.
+
+### `setup_grafana.py`
+Calls Grafana's REST API to create the data source connection and all 3 dashboard panels automatically — no manual clicking required.
+
+---
+
+## 5. Step-by-Step Setup & Execution
+
+### Prerequisites
+
+| Requirement | Version | Link |
+|---|---|---|
+| Docker Desktop | Latest | https://www.docker.com/products/docker-desktop/ |
+| Python | 3.9 or 3.10 | https://www.python.org/downloads/ |
+| Free disk space | ~7 GB | For the TAQ `.gz` file |
+
+> Make sure Docker Desktop is **running** before any `docker` command. Enable WSL 2 backend when prompted.
+
+---
+
+### Step 0 — Download the NYSE Dataset
+
+Download this file (~3.4 GB) and save it somewhere on your PC (e.g., `D:\taq-data\`):
+
+```
+https://ftp.nyse.com/Historical%20Data%20Samples/DAILY%20TAQ/EQY_US_ALL_TRADE_20260102.gz
+```
+
+Via PowerShell (faster than browser):
+```powershell
+Invoke-WebRequest -Uri "https://ftp.nyse.com/Historical%20Data%20Samples/DAILY%20TAQ/EQY_US_ALL_TRADE_20260102.gz" -OutFile "EQY_US_ALL_TRADE_20260102.gz"
+```
+
+> **Do NOT unzip the file.** The script reads it with gzip streaming.
+
+---
+
+### Step 1 — Set Your Data Directory
+
+Open `producer/replay_producer.py` and update line 85:
+
+```python
+# Change this to the folder where you saved the .gz file
+DATA_DIR = r"D:\taq-data"
+```
+
+---
+
+### Step 2 — Install Python Packages (Windows Host)
+
+Open a terminal in the `pdcfinal/` folder:
+
+```powershell
+pip install -r requirements.txt
+```
+
+Also install `requests` (needed for Grafana setup script):
+```powershell
+pip install requests
+```
+
+---
+
+### Step 3 — Start All Docker Containers
+
+```powershell
+docker-compose up -d
+```
+
+This starts all 6 containers. **Wait 90 seconds** — Cassandra is slow to initialise.
+
+Check all containers are running:
+```powershell
+docker ps
+```
+
+All 6 should show `Up`. If any show `Restarting`, wait 30 more seconds and try again.
+
+---
+
+### Step 4 — Apply Cassandra Schema
+
+Wait until Cassandra shows `(healthy)` in `docker ps`, then:
+
+```powershell
+docker exec -i cassandra cqlsh < cassandra/schema.cql
+```
+
+Verify the tables were created:
+```powershell
+docker exec -it cassandra cqlsh -e "DESCRIBE stock_market;"
+```
+
+You should see `trades` and `anomalies` listed.
+
+---
+
+### Step 5 — Start the Flink Job (inside the container)
+
+Run in a dedicated terminal (keep it open to see live output):
+```powershell
+docker exec -it flink-jobmanager python3 /opt/flink_job/flink_job.py
+```
+
+Expected output:
+```
+[flink_job] Connected to Cassandra
+[flink_job] Connected to Kafka at kafka:29092, topic=stock-trades
+[flink_job] Processing trades with 10s tumbling windows …
+```
+
+---
+
+### Step 6 — Start the Replay Producer (Windows host)
+
+In a new terminal in the `pdcfinal/` folder:
+```powershell
+python producer/replay_producer.py
+```
+
+Expected output:
+```
+[replay] Connected to Kafka at localhost:9092
+[replay] Pass 1 — reading EQY_US_ALL_TRADE_20260102.gz  (3.41 GB compressed)
+[replay]   500 matched | 1,842,301 scanned | last: AAPL @ 142.55
+[replay]  1,000 matched | 3,204,887 scanned | last: MSFT @ 234.12
+...
+```
+
+---
+
+### Step 7 — Set Up Grafana Dashboard
+
+In a new terminal:
+```powershell
+python setup_grafana.py
+```
+
+This auto-creates the Cassandra data source and all 3 dashboard panels via Grafana's API.
+
+Then open: **http://localhost:3000** → Username: `admin` → Password: `admin`
+
+Navigate to **Dashboards → Stock Anomaly Monitor**.
+
+---
+
+### Step 8 — Verify Everything is Working
+
+**Kafka — check messages are flowing:**
+```powershell
+docker exec -it kafka kafka-console-consumer --bootstrap-server kafka:29092 --topic stock-trades --from-beginning --max-messages 5
+```
+
+**Cassandra — check trades are being stored:**
+```powershell
+docker exec -it cassandra cqlsh -e "SELECT * FROM stock_market.trades LIMIT 10;"
+```
+
+**Cassandra — check anomalies are being detected:**
+```powershell
+docker exec -it cassandra cqlsh -e "SELECT * FROM stock_market.anomalies LIMIT 10;"
+```
+
+> Note: anomalies table will be empty until the producer has run for at least 30 seconds (needs 2+ closed 10-second windows per symbol).
+
+---
+
+### Step 9 — Stop Everything
+
+Stop the producer: `Ctrl+C` in its terminal.
+
+Stop containers (keeps Cassandra data):
+```powershell
+docker-compose down
+```
+
+Full reset (deletes all data — clean slate):
+```powershell
+docker-compose down -v
+```
+
+---
+
+## 6. How the Code Works
+
+### `replay_producer.py` — Detailed Walkthrough
+
+```python
+# 1. Validates that DATA_DIR exists
+# 2. Connects to Kafka (retries every 5s until Kafka is ready)
+# 3. For each .gz file:
+#    - Opens it with gzip streaming (never extracts to disk)
+#    - Reads line by line (pipe-delimited: Time|Exchange|Symbol|...|Price|...)
+#    - Skips lines where Symbol not in the 12-symbol set
+#    - Parses price (column 5) and volume (column 4)
+#    - Converts the TAQ time string (HHMMSS + microseconds) to epoch milliseconds
+#    - Sends JSON record to Kafka topic
+#    - Flushes every 500 matched records + prints progress
+# 4. If LOOP_FOREVER = True, restarts from the beginning
+```
+
+**TAQ File Format** (pipe-delimited, no header):
+| Col | Field | Example |
+|---|---|---|
+| 0 | Time | `093015123456` (HHMMSS+microsec) |
+| 1 | Exchange | `N` (NYSE), `Q` (NASDAQ) |
+| 2 | Symbol | `AAPL` |
+| 4 | Volume | `100` |
+| 5 | Price | `142.5500` |
+
+### `flink_job.py` — Detailed Walkthrough
+
+```python
+# 1. Connects to Cassandra (retries every 5s)
+# 2. Connects to Kafka as a consumer (group_id="flink-anomaly-group")
+# 3. For each message from Kafka:
+#    a. Extracts symbol, price, volume, trade_time
+#    b. Initialises a window start time for new symbols
+#    c. Checks if 10 seconds have elapsed since window started
+#       → If YES: closes window → calls detect_anomalies() → resets window
+#    d. Appends tick to the current open window
+#    e. Writes trade to Cassandra trades table
+```
+
+**`detect_anomalies()` logic:**
+```python
+# Given all ticks in a closed 10-second window for one symbol:
+prices  = [all prices in window]
+volumes = [all volumes in window]
+
+# 1. VOLUME SPIKE: if current window total > 3x average of last 5 windows
+if total_volume > 3 * mean(volume_history):
+    insert_anomaly(... "volume_spike" ...)
+
+# 2. FLASH CRASH: if last price dropped >2% from first price
+if (last_price - first_price) / first_price < -0.02:
+    insert_anomaly(... "flash_crash" ...)
+
+# 3. PRICE SPIKE: if last price rose >2% from first price
+if (last_price - first_price) / first_price > 0.02:
+    insert_anomaly(... "price_spike" ...)
+```
+
+### `schema.cql` — Cassandra Schema Design
+
+```sql
+-- Keyspace: SimpleStrategy, replication_factor=1 (single node, no HA needed)
+CREATE KEYSPACE IF NOT EXISTS stock_market
+  WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1};
+
+-- trades table: partition key = symbol, cluster by time descending
+-- TTL = 86400 seconds (24 hours) — old data auto-deletes
+CREATE TABLE trades (
+    symbol     text,
+    trade_time timestamp,
+    price      double,
+    volume     double,
+    PRIMARY KEY (symbol, trade_time)
+) WITH CLUSTERING ORDER BY (trade_time DESC)
+  AND default_time_to_live = 86400;
+
+-- anomalies table: same structure, 7-day TTL
+CREATE TABLE anomalies (
+    symbol       text,
+    detected_at  timestamp,
+    anomaly_type text,
+    price        double,
+    volume       double,
+    PRIMARY KEY (symbol, detected_at)
+) WITH CLUSTERING ORDER BY (detected_at DESC)
+  AND default_time_to_live = 604800;
+```
+
+---
+
+## 7. PDC Course Concepts
+
+This section maps your project to standard Parallel & Distributed Computing course topics.
+
+### 7.1 Parallelism
+
+| Type | Where in this project |
+|---|---|
+| **Data Parallelism** | The dataset (150M rows) is split and processed record-by-record in parallel across Flink's task slots (4 slots configured) |
+| **Pipeline Parallelism** | Producer, Kafka, Flink, and Cassandra all run simultaneously — while Flink processes batch N, the producer is sending batch N+1 |
+| **Task Parallelism** | Each of the 12 symbols maintains its own independent window state and is processed independently |
+
+### 7.2 Distributed Systems Concepts
+
+| Concept | Implementation |
+|---|---|
+| **Message Passing** | Kafka is a distributed message-passing system. Producer and consumer never communicate directly — all data flows through the broker. |
+| **Decoupling** | Kafka decouples the producer (replay speed) from the consumer (Flink processing speed). If Flink slows down, Kafka buffers the backlog. |
+| **Fault Tolerance** | Kafka persists messages to disk. If Flink restarts, it can re-read from offset. Cassandra has built-in replication (set to 1 here for single-node). |
+| **Distributed Storage** | Cassandra is a distributed NoSQL database. It automatically partitions data across nodes using consistent hashing on the partition key (`symbol`). |
+| **Network Topology** | All services communicate over `stock-net` (Docker bridge network). Kafka advertises two addresses — one for internal Docker comms, one for external host. |
+
+### 7.3 Stream Processing
+
+| Concept | Implementation |
+|---|---|
+| **Stream vs Batch** | This is a **stream processing** system — data is processed record by record in real time, not in large batches loaded into memory |
+| **Windowing** | **Tumbling windows** — fixed 10-second non-overlapping intervals. Each window closes independently per symbol. |
+| **Stateful Processing** | `current_window` and `volume_history` dicts maintain state across messages. This is what allows cross-message comparisons (volume averaging). |
+| **Backpressure** | `MESSAGES_PER_SECOND` in the producer controls the ingest rate. Kafka absorbs spikes. |
+
+### 7.4 Big Data
+
+| Aspect | Detail |
+|---|---|
+| **Volume** | ~150–200 million records per trading day (~3.4 GB compressed) |
+| **Velocity** | Up to 10,000 messages/second configurable throughput |
+| **Variety** | Structured financial tick data (time, symbol, price, volume) |
+| **Processing** | Streaming (not batch MapReduce) |
+
+### 7.5 The Producer-Consumer Problem
+
+This project is a textbook implementation of the distributed **producer-consumer pattern**:
+- **Producer** (`replay_producer.py`): generates data at `MESSAGES_PER_SECOND` rate
+- **Buffer** (Kafka): a bounded, persistent, distributed queue
+- **Consumer** (`flink_job.py`): processes data at its own rate
+- If consumer is slow, Kafka holds messages. If producer is slow, consumer waits — no data is lost.
+
+---
+
+## 8. Viva Q&A Preparation
+
+### General Understanding
+
+**Q: What is the purpose of this project?**  
+A: To build a real-time stream processing pipeline that ingests large-scale NYSE trade data, detects market anomalies (price crashes, spikes, volume explosions), stores results in a distributed database, and visualises them on a live dashboard.
+
+**Q: Why did you use Kafka instead of sending data directly to Flink?**  
+A: Kafka decouples the producer and consumer. It acts as a buffer — if Flink is slow or restarts, messages are not lost. It also allows multiple consumers to read the same data independently.
+
+**Q: What is a tumbling window?**  
+A: A fixed-size, non-overlapping time interval. Every 10 seconds, the window closes, anomaly detection runs on all the data collected in that window, and a new empty window opens. Unlike sliding windows, there is no overlap between windows.
+
+**Q: How does Flink run the Python job? Is it a proper Flink job?**  
+A: The Flink container is used as a Python execution environment. The job is a plain Python script using `kafka-python` and `cassandra-driver` directly. It does not use the PyFlink API or submit a JAR. This was intentional for simplicity and reliability in a university setting.
+
+**Q: Why does Cassandra use `symbol` as the partition key?**  
+A: Queries always filter by symbol (e.g., "give me all AAPL trades"). Partitioning by symbol ensures all trades for one stock are co-located on the same Cassandra node, making reads fast. The clustering key `trade_time` sorts data within each partition by time.
+
+**Q: What is Zookeeper's role?**  
+A: Zookeeper manages Kafka's cluster metadata — it tracks which brokers are alive, which broker is the leader for each topic partition, and stores consumer group offsets. (Note: newer Kafka versions replace Zookeeper with KRaft, but this project uses Kafka 7.4 which still requires Zookeeper.)
+
+**Q: What are the three anomaly types and how are they detected?**  
+A:
+- **volume_spike**: The total trade volume in the current 10-second window exceeds 3× the average volume of the last 5 closed windows.
+- **flash_crash**: The last price in the window is more than 2% lower than the first price — indicating a rapid drop.
+- **price_spike**: The last price in the window is more than 2% higher than the first price — indicating a rapid rise.
+
+**Q: How does the producer read a 3.4 GB file without crashing the system?**  
+A: Python's `gzip.open()` is used in streaming mode — it reads and decompresses one line at a time, never loading the full file into memory. This is called **streaming/lazy I/O**.
+
+**Q: What does `docker-compose up -d` do?**  
+A: It reads `docker-compose.yml` and starts all defined services as background daemon containers. The `-d` flag means detached (runs in background). Docker automatically creates the `stock-net` bridge network.
+
+**Q: Why are there two Kafka addresses (9092 and 29092)?**  
+A: Kafka must advertise addresses that are reachable by each client. `localhost:9092` is used by the Windows host (replay producer). `kafka:29092` is used by containers inside the Docker network (Flink job). They are the same broker — just different network interfaces.
+
+**Q: What is the role of the `KAFKA_GROUP = "flink-anomaly-group"` consumer group?**  
+A: A consumer group allows Kafka to track which messages have been processed. If the Flink job restarts, it resumes from the last committed offset in that group, not from the beginning.
+
+**Q: How does Cassandra's TTL (Time-To-Live) work?**  
+A: When a row is inserted, Cassandra starts a countdown timer equal to the TTL value (e.g., 86400 seconds = 24 hours). After that time, the row is automatically deleted without any manual cleanup needed.
+
+**Q: What is a keyspace in Cassandra?**  
+A: The Cassandra equivalent of a database in SQL. It defines the replication strategy for all tables within it. This project uses `stock_market` as the keyspace with `SimpleStrategy` (single datacenter) and replication factor 1.
+
+**Q: What PDC concept does the pipeline parallelism represent?**  
+A: It represents **pipeline parallelism** — the producer, Kafka, Flink, and Cassandra all operate concurrently. While Flink processes one message, the producer is reading the next from the file, Kafka is buffering new messages, and Cassandra is committing previous writes — all in parallel.
+
+**Q: How is this a Big Data project?**  
+A: It processes a single-day dataset of 150–200 million trade records (3.4 GB compressed, 14 GB uncompressed), which far exceeds what any single-machine traditional program could handle in real time. The pipeline architecture (Kafka + Flink + Cassandra) is specifically designed for distributed, high-throughput data at this scale.
+
+**Q: What would happen if you set `MESSAGES_PER_SECOND = 0`?**  
+A: The producer would send as fast as the hardware allows (no throttle). This is the maximum throughput stress test — Kafka would buffer the burst and Flink would process as fast as it can.
+
+**Q: What is `ALLOW FILTERING` in Cassandra CQL?**  
+A: It tells Cassandra to scan all data to satisfy the query, even if the query is not using the full primary key. It is needed for time-range queries on columns that are not partition keys. In production, this would be replaced with proper partition key queries for performance.
+
+---
+
+## 9. Port & Service Reference
+
+| Service | Host Address | Docker Network Address |
+|---|---|---|
+| Kafka | `localhost:9092` | `kafka:29092` |
+| Zookeeper | — | `zookeeper:2181` |
+| Flink Web UI | http://localhost:8081 | — |
+| Cassandra | `localhost:9042` | `cassandra:9042` |
+| Grafana Dashboard | http://localhost:3000 | — |
+
+**Grafana credentials:** `admin` / `admin`
+
+---
+
+## 10. Troubleshooting
+
+| Problem | Solution |
+|---|---|
+| Container shows `Restarting` | Wait 90s total; Cassandra is the slowest to start |
+| `cqlsh` schema command fails | Cassandra not healthy yet — wait for `(healthy)` in `docker ps` |
+| Flink job prints "Cassandra not ready" | Normal — it retries every 5s automatically |
+| Producer prints "Kafka not ready" | Normal — it retries every 5s automatically |
+| `DATA_DIR not found` error | Edit line 85 in `replay_producer.py` to your actual `.gz` file folder |
+| Anomalies table stays empty | Let producer run 30+ seconds — needs ≥2 closed windows per symbol to compare |
+| Grafana plugin not found | Run `docker-compose down` then `docker-compose up -d`, wait 2 min |
+| Port 9092 already in use | Stop any other Kafka/local broker; or change port in `docker-compose.yml` |
+| `setup_grafana.py` fails with datasource error | Add Cassandra datasource manually first (see Grafana UI: Connections → Data Sources) |
+| 0 matching trades found | Symbol names in TAQ are uppercase with no spaces — already handled in code |
+
+---
+
+*Good luck on your viva! Remember: you are building a production-grade distributed streaming pipeline that processes the same data used by Wall Street trading systems.*
